@@ -4,6 +4,8 @@ A minimal macOS menu bar app that displays real-time upload/download speeds.
 
 ![macOS](https://img.shields.io/badge/macOS-12.0%2B-blue)
 
+![SpeedBar in menu bar](assets/screenshot.png)
+
 ## Download
 
 **For most users:** Download the latest release and run—no coding required.
