@@ -15,7 +15,11 @@ A minimal macOS menu bar app that displays real-time upload/download speeds.
 3. Unzip and drag `InternetSpeed.app` to your Applications folder
 4. Double-click to run
 
-> **Note:** On first launch, macOS may block the app. Right-click the app → **Open** → **Open** to allow it.
+> **Note:** macOS may show "app is damaged" for unsigned apps downloaded from the internet. Fix it by running:
+> ```bash
+> xattr -cr /path/to/InternetSpeed.app
+> ```
+> Then double-click to open normally.
 
 ## Usage
 
@@ -28,7 +32,7 @@ Click the menu bar item and select **Quit** to exit.
 
 ### Launch at Login
 
-1. Open **System Settings** → **General** → **Login Items**
+1. Open **System Settings** → **General** → **Login Items & Extensions**
 2. Click **+** and add `InternetSpeed.app`
 
 ---
