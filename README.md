@@ -57,7 +57,7 @@ open InternetSpeed.app
 
 ---
 
-## Creating a Release (for maintainers)
+## Creating a Release (for devs)
 
 To publish a new release with downloadable artifacts:
 
