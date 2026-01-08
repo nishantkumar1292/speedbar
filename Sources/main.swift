@@ -9,7 +9,9 @@ class NetworkMonitor {
         let now = Date()
         let elapsed = now.timeIntervalSince(lastTime)
         
-        guard elapsed > 0, lastBytes.rx > 0 else {
+        // Reset baseline if: first run, too much time elapsed (sleep), or counter reset
+        guard elapsed > 0, elapsed < 10, lastBytes.rx > 0,
+              current.rx >= lastBytes.rx, current.tx >= lastBytes.tx else {
             lastBytes = current
             lastTime = now
             return (0, 0)
@@ -22,6 +24,11 @@ class NetworkMonitor {
         lastTime = now
         
         return (rxSpeed, txSpeed)
+    }
+    
+    func reset() {
+        lastBytes = (0, 0)
+        lastTime = Date()
     }
     
     private func getTotalBytes() -> (rx: UInt64, tx: UInt64) {
@@ -69,10 +76,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Initial read to establish baseline
         _ = monitor.getSpeed()
+        startTimer()
         
+        // Handle sleep/wake cycles
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleWake),
+            name: NSWorkspace.didWakeNotification, object: nil)
+    }
+    
+    @objc private func handleWake() {
+        monitor.reset()
+        startTimer()
+    }
+    
+    private func startTimer() {
+        timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateSpeed()
         }
+        timer?.tolerance = 0.2 // Helps with power efficiency
     }
     
     private func updateSpeed() {
