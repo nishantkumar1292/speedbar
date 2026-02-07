@@ -297,11 +297,23 @@ class SpeedTest {
 
 // MARK: - Chart View
 class LatencyChartView: NSView {
+    private struct YAxisScale {
+        let maxValue: Double
+        let interval: Double
+        let tickCount: Int
+    }
+
     var latencyHistory: [LatencyPoint] = []
     private let chartPadding: CGFloat = 10
     private let rightPadding: CGFloat = 45
     private let bottomPadding: CGFloat = 22
     private let topPadding: CGFloat = 8
+    private let windowDuration: TimeInterval = 300
+    private let defaultMaxLatency: Double = 600
+    private let thresholdLatency: Double = 300
+    private let yAxisTickCount = 5
+    private let yAxisHeadroomMultiplier = 1.15
+    private let yAxisStepRounding: Double = 10
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -316,45 +328,85 @@ class LatencyChartView: NSView {
             height: bounds.height - bottomPadding - topPadding
         )
 
-        drawYAxis(in: chartRect)
-        drawXAxis(in: chartRect)
-        drawLatencyLine(in: chartRect)
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-windowDuration)
+        let validPoints = latencyHistory.filter { $0.latency >= 0 && $0.timestamp >= windowStart }
+        let axisScale = computeYAxisScale(from: validPoints)
+
+        drawYAxis(in: chartRect, scale: axisScale)
+        drawXAxis(in: chartRect, now: now)
+        drawLatencyLine(in: chartRect, points: validPoints, windowStart: windowStart, scale: axisScale)
     }
 
-    private func drawYAxis(in rect: NSRect) {
-        let labels = ["600 ms", "450 ms", "300 ms", "150 ms", "0 ms"]
+    private func computeYAxisScale(from points: [LatencyPoint]) -> YAxisScale {
+        let peakLatency = points.map(\.latency).max() ?? 0
+        let denominator = Double(yAxisTickCount - 1)
+
+        if peakLatency <= defaultMaxLatency {
+            return YAxisScale(
+                maxValue: defaultMaxLatency,
+                interval: defaultMaxLatency / denominator,
+                tickCount: yAxisTickCount
+            )
+        }
+
+        let targetMax = peakLatency * yAxisHeadroomMultiplier
+        let rawInterval = targetMax / denominator
+        let interval = ceil(rawInterval / yAxisStepRounding) * yAxisStepRounding
+        let maxValue = interval * denominator
+        return YAxisScale(maxValue: maxValue, interval: interval, tickCount: yAxisTickCount)
+    }
+
+    private func yPosition(for latency: Double, in rect: NSRect, scale: YAxisScale) -> CGFloat {
+        let normalized = max(0, min(latency / scale.maxValue, 1))
+        return rect.minY + rect.height * CGFloat(normalized)
+    }
+
+    private func drawYAxis(in rect: NSRect, scale: YAxisScale) {
+        let labels = (0..<scale.tickCount).map { index in
+            let value = scale.maxValue - (Double(index) * scale.interval)
+            return "\(Int(value.rounded())) ms"
+        }
         let attrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: Theme.textSecondary,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         ]
 
+        let denominator = CGFloat(scale.tickCount - 1)
         for (i, label) in labels.enumerated() {
-            let y = rect.minY + rect.height * CGFloat(labels.count - 1 - i) / CGFloat(labels.count - 1) - 5
+            let y = rect.minY + rect.height * CGFloat(scale.tickCount - 1 - i) / denominator - 5
             (label as NSString).draw(at: NSPoint(x: rect.maxX + 5, y: y), withAttributes: attrs)
         }
 
         Theme.gridLine.setStroke()
-        for i in 0..<labels.count {
-            let y = rect.minY + rect.height * CGFloat(i) / CGFloat(labels.count - 1)
+        for i in 0..<scale.tickCount {
+            let tickValue = Double(i) * scale.interval
+            if abs(tickValue - thresholdLatency) < 0.001 {
+                continue
+            }
+
+            let y = rect.minY + rect.height * CGFloat(i) / denominator
             let path = NSBezierPath()
             path.move(to: NSPoint(x: rect.minX, y: y))
             path.line(to: NSPoint(x: rect.maxX, y: y))
             path.lineWidth = 0.5
+            path.stroke()
+        }
 
-            if i == 2 { // 300ms threshold - dashed line
-                let dashes: [CGFloat] = [4, 4]
-                path.setLineDash(dashes, count: 2, phase: 0)
-                NSColor(red: 0.4, green: 0.45, blue: 0.55, alpha: 1.0).setStroke()
-                path.stroke()
-                Theme.gridLine.setStroke()
-            } else {
-                path.stroke()
-            }
+        if thresholdLatency >= 0, thresholdLatency <= scale.maxValue {
+            let thresholdY = yPosition(for: thresholdLatency, in: rect, scale: scale)
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: rect.minX, y: thresholdY))
+            path.line(to: NSPoint(x: rect.maxX, y: thresholdY))
+            path.lineWidth = 0.5
+            let dashes: [CGFloat] = [4, 4]
+            path.setLineDash(dashes, count: 2, phase: 0)
+            NSColor(red: 0.4, green: 0.45, blue: 0.55, alpha: 1.0).setStroke()
+            path.stroke()
         }
     }
 
-    private func drawXAxis(in rect: NSRect) {
-        let now = Date()
+    private func drawXAxis(in rect: NSRect, now: Date) {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
 
@@ -363,32 +415,28 @@ class LatencyChartView: NSView {
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         ]
 
-        for i in 0..<5 {
-            let timeOffset = TimeInterval(-300 + i * 75)
+        let labelCount = 5
+        let interval = windowDuration / Double(labelCount - 1)
+        for i in 0..<labelCount {
+            let timeOffset = (-windowDuration + (Double(i) * interval))
             let time = now.addingTimeInterval(timeOffset)
             let label = formatter.string(from: time)
-            let x = rect.minX + rect.width * CGFloat(i) / 4
+            let x = rect.minX + rect.width * CGFloat(i) / CGFloat(labelCount - 1)
             (label as NSString).draw(at: NSPoint(x: x - 20, y: 5), withAttributes: attrs)
         }
     }
 
-    private func drawLatencyLine(in rect: NSRect) {
-        guard latencyHistory.count > 1 else { return }
-
-        let now = Date()
-        let windowStart = now.addingTimeInterval(-300)
-        let validPoints = latencyHistory.filter { $0.latency >= 0 && $0.timestamp >= windowStart }
-        guard validPoints.count > 1 else { return }
+    private func drawLatencyLine(in rect: NSRect, points: [LatencyPoint], windowStart: Date, scale: YAxisScale) {
+        guard points.count > 1 else { return }
 
         // Draw glow effect
         let glowPath = NSBezierPath()
         var started = false
 
-        for point in validPoints {
-            let timeFraction = point.timestamp.timeIntervalSince(windowStart) / 300
+        for point in points {
+            let timeFraction = max(0, min(point.timestamp.timeIntervalSince(windowStart) / windowDuration, 1))
             let x = rect.minX + rect.width * CGFloat(timeFraction)
-            let normalizedLatency = min(point.latency, 600) / 600
-            let y = rect.minY + rect.height * CGFloat(normalizedLatency)
+            let y = yPosition(for: point.latency, in: rect, scale: scale)
 
             if !started {
                 glowPath.move(to: NSPoint(x: x, y: y))
@@ -820,7 +868,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Current Speeds Header
         let speedsHeader = SectionHeaderView(
             frame: NSRect(x: 10, y: popoverHeight - 205, width: popoverWidth - 20, height: 30),
-            title: "CURRENT SPEEDS",
+            title: "LAST SPEED TEST RESULT",
             icon: "⚡"
         )
         mainView.addSubview(speedsHeader)
