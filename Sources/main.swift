@@ -77,6 +77,7 @@ struct LatencyPoint {
 class LatencyMonitor {
     private(set) var history: [LatencyPoint] = []
     private let maxHistoryDuration: TimeInterval = 300
+    private let timeoutLatencyMs: Double = 2000
     private let queue = DispatchQueue(label: "latency.monitor")
 
     func measureLatency(completion: @escaping (Double) -> Void) {
@@ -89,7 +90,7 @@ class LatencyMonitor {
                 guard !completed else { return }
                 completed = true
                 connection.cancel()
-                DispatchQueue.main.async { completion(-1) }
+                DispatchQueue.main.async { completion(self.timeoutLatencyMs) }
             }
             self.queue.asyncAfter(deadline: .now() + 2, execute: timeout)
 
@@ -105,7 +106,7 @@ class LatencyMonitor {
                     completed = true
                     timeout.cancel()
                     connection.cancel()
-                    DispatchQueue.main.async { completion(-1) }
+                    DispatchQueue.main.async { completion(self.timeoutLatencyMs) }
                 }
             }
             connection.start(queue: self.queue)
@@ -309,7 +310,7 @@ class LatencyChartView: NSView {
     private let bottomPadding: CGFloat = 22
     private let topPadding: CGFloat = 8
     private let windowDuration: TimeInterval = 300
-    private let defaultMaxLatency: Double = 600
+    private let defaultMaxLatency: Double = 300
     private let thresholdLatency: Double = 300
     private let yAxisTickCount = 5
     private let yAxisHeadroomMultiplier = 1.15
@@ -330,7 +331,7 @@ class LatencyChartView: NSView {
 
         let now = Date()
         let windowStart = now.addingTimeInterval(-windowDuration)
-        let validPoints = latencyHistory.filter { $0.latency >= 0 && $0.timestamp >= windowStart }
+        let validPoints = latencyHistory.filter { $0.timestamp >= windowStart && $0.latency.isFinite }
         let axisScale = computeYAxisScale(from: validPoints)
 
         drawYAxis(in: chartRect, scale: axisScale)
