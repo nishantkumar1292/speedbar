@@ -83,7 +83,7 @@ class LatencyMonitor {
     func measureLatency(completion: @escaping (Double) -> Void) {
         queue.async {
             let start = Date()
-            let connection = NWConnection(host: "8.8.8.8", port: 53, using: .tcp)
+            let connection = NWConnection(host: "8.8.8.8", port: 443, using: .tcp)
             var completed = false
 
             let timeout = DispatchWorkItem {
