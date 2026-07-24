@@ -11,6 +11,9 @@ struct Theme {
     static let textSecondary = NSColor(red: 0.6, green: 0.65, blue: 0.7, alpha: 1.0)
     static let gridLine = NSColor(red: 0.25, green: 0.30, blue: 0.38, alpha: 1.0)
     static let chartLine = NSColor(red: 0.3, green: 0.6, blue: 0.95, alpha: 1.0)
+    static let chartFill = NSColor(red: 0.3, green: 0.6, blue: 0.95, alpha: 0.12)
+    static let warning = NSColor(red: 0.95, green: 0.68, blue: 0.24, alpha: 1.0)
+    static let critical = NSColor(red: 0.95, green: 0.35, blue: 0.38, alpha: 1.0)
     static let buttonGradientTop = NSColor(red: 0.3, green: 0.7, blue: 0.95, alpha: 1.0)
     static let buttonGradientBottom = NSColor(red: 0.2, green: 0.5, blue: 0.8, alpha: 1.0)
     static let progressBackground = NSColor(red: 0.1, green: 0.35, blue: 0.5, alpha: 1.0)
@@ -71,49 +74,69 @@ class NetworkMonitor {
 // MARK: - Latency Monitor
 struct LatencyPoint {
     let timestamp: Date
-    let latency: Double
+    let latency: Double?
+}
+
+enum LatencyMeasurement {
+    case success(milliseconds: Double)
+    case unavailable
 }
 
 class LatencyMonitor {
     private(set) var history: [LatencyPoint] = []
     private let maxHistoryDuration: TimeInterval = 300
-    private let timeoutLatencyMs: Double = 2000
     private let queue = DispatchQueue(label: "latency.monitor")
+    private var isMeasuring = false
+    private let probeTimeout: TimeInterval = 1.5
 
-    func measureLatency(completion: @escaping (Double) -> Void) {
+    func measureLatency(completion: @escaping (LatencyMeasurement) -> Void) {
         queue.async {
-            let start = Date()
-            let connection = NWConnection(host: "8.8.8.8", port: 443, using: .tcp)
-            var completed = false
+            guard !self.isMeasuring else { return }
+            self.isMeasuring = true
 
-            let timeout = DispatchWorkItem {
+            let start = Date()
+            // A single anycast target keeps samples comparable while avoiding DNS lookup time.
+            let connection = NWConnection(host: "1.1.1.1", port: 443, using: .tcp)
+            var completed = false
+            var timeout: DispatchWorkItem?
+
+            let finish: (LatencyMeasurement) -> Void = { result in
                 guard !completed else { return }
                 completed = true
+                timeout?.cancel()
                 connection.cancel()
-                DispatchQueue.main.async { completion(self.timeoutLatencyMs) }
+                self.isMeasuring = false
+                DispatchQueue.main.async { completion(result) }
             }
-            self.queue.asyncAfter(deadline: .now() + 2, execute: timeout)
+
+            let timeoutWorkItem = DispatchWorkItem {
+                finish(.unavailable)
+            }
+            timeout = timeoutWorkItem
+            self.queue.asyncAfter(deadline: .now() + self.probeTimeout, execute: timeoutWorkItem)
 
             connection.stateUpdateHandler = { state in
                 guard !completed else { return }
                 if case .ready = state {
-                    completed = true
-                    timeout.cancel()
                     let latency = Date().timeIntervalSince(start) * 1000
-                    connection.cancel()
-                    DispatchQueue.main.async { completion(latency) }
+                    finish(.success(milliseconds: latency))
                 } else if case .failed = state {
-                    completed = true
-                    timeout.cancel()
-                    connection.cancel()
-                    DispatchQueue.main.async { completion(self.timeoutLatencyMs) }
+                    finish(.unavailable)
                 }
             }
             connection.start(queue: self.queue)
         }
     }
 
-    func record(_ latency: Double) {
+    func record(_ measurement: LatencyMeasurement) {
+        let latency: Double?
+        switch measurement {
+        case .success(let milliseconds):
+            latency = max(0, milliseconds)
+        case .unavailable:
+            latency = nil
+        }
+
         let point = LatencyPoint(timestamp: Date(), latency: latency)
         history.append(point)
         pruneOldData()
@@ -308,13 +331,13 @@ class LatencyChartView: NSView {
     private let chartPadding: CGFloat = 10
     private let rightPadding: CGFloat = 45
     private let bottomPadding: CGFloat = 22
-    private let topPadding: CGFloat = 8
+    private let topPadding: CGFloat = 27
     private let windowDuration: TimeInterval = 300
-    private let defaultMaxLatency: Double = 300
-    private let thresholdLatency: Double = 300
+    private let sampleInterval: TimeInterval = 1
+    private let minimumYAxisMax: Double = 20
+    private let warningLatency: Double = 100
     private let yAxisTickCount = 5
-    private let yAxisHeadroomMultiplier = 1.15
-    private let yAxisStepRounding: Double = 10
+    private let yAxisHeadroomMultiplier = 1.25
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -331,36 +354,131 @@ class LatencyChartView: NSView {
 
         let now = Date()
         let windowStart = now.addingTimeInterval(-windowDuration)
-        let validPoints = latencyHistory.filter { $0.timestamp >= windowStart && $0.latency.isFinite }
-        let axisScale = computeYAxisScale(from: validPoints)
+        let visiblePoints = latencyHistory.filter { $0.timestamp >= windowStart }
+        let validLatencies = visiblePoints.compactMap(\.latency).filter(\.isFinite)
+        let axisScale = computeYAxisScale(from: validLatencies)
 
+        drawSummary(points: visiblePoints, now: now)
         drawYAxis(in: chartRect, scale: axisScale)
-        drawXAxis(in: chartRect, now: now)
-        drawLatencyLine(in: chartRect, points: validPoints, windowStart: windowStart, scale: axisScale)
+        drawXAxis(in: chartRect)
+        drawLatencyLine(in: chartRect, points: visiblePoints, windowStart: windowStart, scale: axisScale)
+        drawExceptionalMarkers(in: chartRect, points: visiblePoints, windowStart: windowStart, scale: axisScale)
     }
 
-    private func computeYAxisScale(from points: [LatencyPoint]) -> YAxisScale {
-        let peakLatency = points.map(\.latency).max() ?? 0
+    private func computeYAxisScale(from latencies: [Double]) -> YAxisScale {
         let denominator = Double(yAxisTickCount - 1)
-
-        if peakLatency <= defaultMaxLatency {
+        guard !latencies.isEmpty else {
             return YAxisScale(
-                maxValue: defaultMaxLatency,
-                interval: defaultMaxLatency / denominator,
+                maxValue: minimumYAxisMax,
+                interval: minimumYAxisMax / denominator,
                 tickCount: yAxisTickCount
             )
         }
 
-        let targetMax = peakLatency * yAxisHeadroomMultiplier
-        let rawInterval = targetMax / denominator
-        let interval = ceil(rawInterval / yAxisStepRounding) * yAxisStepRounding
-        let maxValue = interval * denominator
-        return YAxisScale(maxValue: maxValue, interval: interval, tickCount: yAxisTickCount)
+        // A robust high-percentile scale keeps one old spike from flattening the
+        // remaining five minutes. Values beyond the scale get explicit markers.
+        let sorted = latencies.sorted()
+        let percentileIndex = min(
+            sorted.count - 1,
+            max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
+        )
+        let representativePeak = sorted[percentileIndex]
+        let targetMax = max(minimumYAxisMax, representativePeak * yAxisHeadroomMultiplier)
+        let interval = niceInterval(for: targetMax / denominator)
+
+        return YAxisScale(
+            maxValue: interval * denominator,
+            interval: interval,
+            tickCount: yAxisTickCount
+        )
+    }
+
+    private func niceInterval(for value: Double) -> Double {
+        guard value > 0 else { return 5 }
+        let magnitude = pow(10, floor(log10(value)))
+        let fraction = value / magnitude
+        let niceFraction: Double
+
+        if fraction <= 1 {
+            niceFraction = 1
+        } else if fraction <= 2 {
+            niceFraction = 2
+        } else if fraction <= 5 {
+            niceFraction = 5
+        } else {
+            niceFraction = 10
+        }
+
+        return niceFraction * magnitude
     }
 
     private func yPosition(for latency: Double, in rect: NSRect, scale: YAxisScale) -> CGFloat {
         let normalized = max(0, min(latency / scale.maxValue, 1))
         return rect.minY + rect.height * CGFloat(normalized)
+    }
+
+    private func drawSummary(points: [LatencyPoint], now: Date) {
+        let recentCutoff = now.addingTimeInterval(-60)
+        let recentValues = points
+            .filter { $0.timestamp >= recentCutoff }
+            .compactMap(\.latency)
+            .filter(\.isFinite)
+        let average = recentValues.isEmpty
+            ? nil
+            : recentValues.reduce(0, +) / Double(recentValues.count)
+
+        let latestText: String
+        let latestColor: NSColor
+        if let latestPoint = points.last {
+            if let latency = latestPoint.latency, latency.isFinite {
+                latestText = "NOW \(Int(latency.rounded())) ms"
+                latestColor = statusColor(for: latency)
+            } else {
+                latestText = "NO RESPONSE"
+                latestColor = Theme.critical
+            }
+        } else {
+            latestText = "MEASURING…"
+            latestColor = Theme.textSecondary
+        }
+
+        let currentAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: latestColor,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        ]
+        (latestText as NSString).draw(
+            at: NSPoint(x: chartPadding, y: bounds.maxY - 19),
+            withAttributes: currentAttrs
+        )
+
+        if let average {
+            let averageText = "1M AVG \(Int(average.rounded())) ms"
+            let averageAttrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: Theme.textSecondary,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+            ]
+            (averageText as NSString).draw(
+                at: NSPoint(x: chartPadding + 88, y: bounds.maxY - 18),
+                withAttributes: averageAttrs
+            )
+        }
+
+        let cadenceText = "1s · 5m"
+        let cadenceAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: Theme.textSecondary,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        ]
+        let cadenceSize = (cadenceText as NSString).size(withAttributes: cadenceAttrs)
+        (cadenceText as NSString).draw(
+            at: NSPoint(x: bounds.maxX - chartPadding - cadenceSize.width, y: bounds.maxY - 18),
+            withAttributes: cadenceAttrs
+        )
+    }
+
+    private func statusColor(for latency: Double) -> NSColor {
+        if latency >= 200 { return Theme.critical }
+        if latency >= warningLatency { return Theme.warning }
+        return Theme.chartLine
     }
 
     private func drawYAxis(in rect: NSRect, scale: YAxisScale) {
@@ -382,7 +500,8 @@ class LatencyChartView: NSView {
         Theme.gridLine.setStroke()
         for i in 0..<scale.tickCount {
             let tickValue = Double(i) * scale.interval
-            if abs(tickValue - thresholdLatency) < 0.001 {
+            if warningLatency < scale.maxValue,
+               abs(tickValue - warningLatency) < 0.001 {
                 continue
             }
 
@@ -394,69 +513,171 @@ class LatencyChartView: NSView {
             path.stroke()
         }
 
-        if thresholdLatency >= 0, thresholdLatency <= scale.maxValue {
-            let thresholdY = yPosition(for: thresholdLatency, in: rect, scale: scale)
+        if warningLatency > 0, warningLatency < scale.maxValue {
+            let thresholdY = yPosition(for: warningLatency, in: rect, scale: scale)
             let path = NSBezierPath()
             path.move(to: NSPoint(x: rect.minX, y: thresholdY))
             path.line(to: NSPoint(x: rect.maxX, y: thresholdY))
             path.lineWidth = 0.5
             let dashes: [CGFloat] = [4, 4]
             path.setLineDash(dashes, count: 2, phase: 0)
-            NSColor(red: 0.4, green: 0.45, blue: 0.55, alpha: 1.0).setStroke()
+            Theme.warning.withAlphaComponent(0.55).setStroke()
             path.stroke()
         }
     }
 
-    private func drawXAxis(in rect: NSRect, now: Date) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a"
-
+    private func drawXAxis(in rect: NSRect) {
         let attrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: Theme.textSecondary,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         ]
 
-        let labelCount = 5
-        let interval = windowDuration / Double(labelCount - 1)
-        for i in 0..<labelCount {
-            let timeOffset = (-windowDuration + (Double(i) * interval))
-            let time = now.addingTimeInterval(timeOffset)
-            let label = formatter.string(from: time)
-            let x = rect.minX + rect.width * CGFloat(i) / CGFloat(labelCount - 1)
-            (label as NSString).draw(at: NSPoint(x: x - 20, y: 5), withAttributes: attrs)
+        let labels = ["−5m", "−4m", "−3m", "−2m", "−1m", "now"]
+        Theme.gridLine.withAlphaComponent(0.45).setStroke()
+
+        for i in 0..<labels.count {
+            let fraction = CGFloat(i) / CGFloat(labels.count - 1)
+            let x = rect.minX + rect.width * fraction
+            let label = labels[i]
+            let labelSize = (label as NSString).size(withAttributes: attrs)
+            let labelX = max(
+                chartPadding,
+                min(x - labelSize.width / 2, rect.maxX - labelSize.width)
+            )
+            (label as NSString).draw(at: NSPoint(x: labelX, y: 5), withAttributes: attrs)
+
+            let gridPath = NSBezierPath()
+            gridPath.move(to: NSPoint(x: x, y: rect.minY))
+            gridPath.line(to: NSPoint(x: x, y: rect.maxY))
+            gridPath.lineWidth = 0.5
+            gridPath.stroke()
         }
     }
 
-    private func drawLatencyLine(in rect: NSRect, points: [LatencyPoint], windowStart: Date, scale: YAxisScale) {
-        guard points.count > 1 else { return }
+    private func xPosition(for timestamp: Date, in rect: NSRect, windowStart: Date) -> CGFloat {
+        let fraction = max(0, min(timestamp.timeIntervalSince(windowStart) / windowDuration, 1))
+        return rect.minX + rect.width * CGFloat(fraction)
+    }
 
-        // Draw glow effect
-        let glowPath = NSBezierPath()
-        var started = false
+    private func makeLineSegments(
+        in rect: NSRect,
+        points: [LatencyPoint],
+        windowStart: Date,
+        scale: YAxisScale
+    ) -> [[NSPoint]] {
+        var segments: [[NSPoint]] = []
+        var current: [NSPoint] = []
+        var previousTimestamp: Date?
 
         for point in points {
-            let timeFraction = max(0, min(point.timestamp.timeIntervalSince(windowStart) / windowDuration, 1))
-            let x = rect.minX + rect.width * CGFloat(timeFraction)
-            let y = yPosition(for: point.latency, in: rect, scale: scale)
+            guard let latency = point.latency, latency.isFinite else {
+                if !current.isEmpty { segments.append(current) }
+                current = []
+                previousTimestamp = nil
+                continue
+            }
 
-            if !started {
-                glowPath.move(to: NSPoint(x: x, y: y))
-                started = true
-            } else {
-                glowPath.line(to: NSPoint(x: x, y: y))
+            if let previousTimestamp,
+               point.timestamp.timeIntervalSince(previousTimestamp) > sampleInterval * 2.5 {
+                if !current.isEmpty { segments.append(current) }
+                current = []
+            }
+
+            current.append(
+                NSPoint(
+                    x: xPosition(for: point.timestamp, in: rect, windowStart: windowStart),
+                    y: yPosition(for: latency, in: rect, scale: scale)
+                )
+            )
+            previousTimestamp = point.timestamp
+        }
+
+        if !current.isEmpty { segments.append(current) }
+        return segments
+    }
+
+    private func path(for points: [NSPoint]) -> NSBezierPath {
+        let path = NSBezierPath()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        for point in points.dropFirst() {
+            path.line(to: point)
+        }
+        return path
+    }
+
+    private func drawLatencyLine(in rect: NSRect, points: [LatencyPoint], windowStart: Date, scale: YAxisScale) {
+        let segments = makeLineSegments(
+            in: rect,
+            points: points,
+            windowStart: windowStart,
+            scale: scale
+        )
+
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: rect).addClip()
+
+        for segment in segments {
+            guard !segment.isEmpty else { continue }
+            let linePath = path(for: segment)
+
+            if segment.count > 1, let first = segment.first, let last = segment.last {
+                let fillPath = linePath.copy() as! NSBezierPath
+                fillPath.line(to: NSPoint(x: last.x, y: rect.minY))
+                fillPath.line(to: NSPoint(x: first.x, y: rect.minY))
+                fillPath.close()
+                Theme.chartFill.setFill()
+                fillPath.fill()
+            }
+
+            Theme.accentGlow.withAlphaComponent(0.24).setStroke()
+            linePath.lineWidth = 4
+            linePath.lineJoinStyle = .round
+            linePath.stroke()
+
+            Theme.chartLine.setStroke()
+            linePath.lineWidth = 1.5
+            linePath.lineJoinStyle = .round
+            linePath.stroke()
+
+            if segment.count == 1, let point = segment.first {
+                Theme.chartLine.setFill()
+                NSBezierPath(ovalIn: NSRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3)).fill()
             }
         }
 
-        // Draw glow
-        Theme.accentGlow.withAlphaComponent(0.3).setStroke()
-        glowPath.lineWidth = 4
-        glowPath.lineJoinStyle = .round
-        glowPath.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+    }
 
-        // Draw main line
-        Theme.chartLine.setStroke()
-        glowPath.lineWidth = 2
-        glowPath.stroke()
+    private func drawExceptionalMarkers(
+        in rect: NSRect,
+        points: [LatencyPoint],
+        windowStart: Date,
+        scale: YAxisScale
+    ) {
+        for point in points {
+            let x = xPosition(for: point.timestamp, in: rect, windowStart: windowStart)
+
+            if let latency = point.latency, latency.isFinite {
+                guard latency > scale.maxValue else { continue }
+                Theme.warning.setFill()
+                let marker = NSBezierPath()
+                marker.move(to: NSPoint(x: x, y: rect.maxY - 6))
+                marker.line(to: NSPoint(x: x - 3, y: rect.maxY - 1))
+                marker.line(to: NSPoint(x: x + 3, y: rect.maxY - 1))
+                marker.close()
+                marker.fill()
+            } else {
+                Theme.critical.setStroke()
+                let marker = NSBezierPath()
+                marker.move(to: NSPoint(x: x - 2.5, y: rect.maxY - 6))
+                marker.line(to: NSPoint(x: x + 2.5, y: rect.maxY - 1))
+                marker.move(to: NSPoint(x: x + 2.5, y: rect.maxY - 6))
+                marker.line(to: NSPoint(x: x - 2.5, y: rect.maxY - 1))
+                marker.lineWidth = 1.2
+                marker.stroke()
+            }
+        }
     }
 }
 
@@ -857,7 +1078,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Connection Delay Header
         let delayHeader = SectionHeaderView(
             frame: NSRect(x: 10, y: popoverHeight - 35, width: popoverWidth - 20, height: 30),
-            title: "CONNECTION DELAY",
+            title: "LIVE LATENCY",
             icon: "◉"
         )
         mainView.addSubview(delayHeader)
@@ -1018,15 +1239,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startLatencyTimer() {
         latencyTimer?.invalidate()
-        latencyTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        let newTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.measureLatency()
         }
+        newTimer.tolerance = 0.1
+        RunLoop.main.add(newTimer, forMode: .common)
+        latencyTimer = newTimer
         measureLatency()
     }
 
     private func measureLatency() {
-        latencyMonitor.measureLatency { [weak self] latency in
-            self?.latencyMonitor.record(latency)
+        latencyMonitor.measureLatency { [weak self] measurement in
+            self?.latencyMonitor.record(measurement)
             if self?.popover.isShown == true {
                 self?.chartView.latencyHistory = self?.latencyMonitor.getRecentHistory() ?? []
                 self?.chartView.needsDisplay = true
