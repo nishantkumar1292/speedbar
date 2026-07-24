@@ -2,6 +2,8 @@
 .build/
 .swiftpm/
 InternetSpeed.app/
+SpeedBar.app/
 *.xcodeproj
 xcuserdata/
-SpeedBar.zip
+*.zip
+.cursor/

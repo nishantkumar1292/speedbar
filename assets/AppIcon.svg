@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#263342"/>
+      <stop offset="1" stop-color="#111820"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58A6FF" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#58A6FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#shell)"/>
+  <rect x="146" y="190" width="732" height="644" rx="126" fill="#19232E" stroke="#3A4A5C" stroke-width="18"/>
+  <g fill="none" stroke="#3B4B5D" stroke-width="10" opacity=".6">
+    <path d="M190 356H834"/>
+    <path d="M190 512H834"/>
+    <path d="M190 668H834"/>
+  </g>
+  <path
+    d="M190 594 C236 594 252 566 286 566 C326 566 336 620 374 620 C418 620 424 458 470 458 C512 458 520 676 566 676 C608 676 622 526 662 526 C700 526 712 576 748 576 C782 576 796 548 834 548"
+    fill="none"
+    stroke="url(#signal)"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <circle cx="756" cy="300" r="54" fill="#34C77B"/>
+  <circle cx="756" cy="300" r="72" fill="none" stroke="#34C77B" stroke-width="14" opacity=".25"/>
+</svg>

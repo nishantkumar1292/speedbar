@@ -1,1269 +1,540 @@
-import Cocoa
-import Network
+import AppKit
+import ServiceManagement
 
-// MARK: - Color Theme
-struct Theme {
-    static let background = NSColor(red: 0.12, green: 0.16, blue: 0.22, alpha: 1.0)
-    static let cardBackground = NSColor(red: 0.15, green: 0.20, blue: 0.28, alpha: 1.0)
-    static let accent = NSColor(red: 0.2, green: 0.6, blue: 0.9, alpha: 1.0)
-    static let accentGlow = NSColor(red: 0.3, green: 0.7, blue: 1.0, alpha: 1.0)
-    static let textPrimary = NSColor.white
-    static let textSecondary = NSColor(red: 0.6, green: 0.65, blue: 0.7, alpha: 1.0)
-    static let gridLine = NSColor(red: 0.25, green: 0.30, blue: 0.38, alpha: 1.0)
-    static let chartLine = NSColor(red: 0.3, green: 0.6, blue: 0.95, alpha: 1.0)
-    static let chartFill = NSColor(red: 0.3, green: 0.6, blue: 0.95, alpha: 0.12)
-    static let warning = NSColor(red: 0.95, green: 0.68, blue: 0.24, alpha: 1.0)
-    static let critical = NSColor(red: 0.95, green: 0.35, blue: 0.38, alpha: 1.0)
-    static let buttonGradientTop = NSColor(red: 0.3, green: 0.7, blue: 0.95, alpha: 1.0)
-    static let buttonGradientBottom = NSColor(red: 0.2, green: 0.5, blue: 0.8, alpha: 1.0)
-    static let progressBackground = NSColor(red: 0.1, green: 0.35, blue: 0.5, alpha: 1.0)
+private enum DefaultsKey {
+    static let hasShownWelcome = "hasShownWelcome"
+    static let lastDownloadSpeed = "lastDownloadSpeed"
+    static let lastUploadSpeed = "lastUploadSpeed"
+    static let lastSpeedTestDate = "lastSpeedTestDate"
 }
 
-// MARK: - Network Monitor
-class NetworkMonitor {
-    private var lastBytes: (rx: UInt64, tx: UInt64) = (0, 0)
-    private var lastTime = Date()
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let connectionMonitor = ConnectionMonitor()
+    private let networkMonitor = NetworkMonitor()
+    private let latencyMonitor = LatencyMonitor()
+    private let speedTest = SpeedTest()
 
-    func getSpeed() -> (download: Double, upload: Double) {
-        let current = getTotalBytes()
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastTime)
-
-        guard elapsed > 0, elapsed < 10, lastBytes.rx > 0,
-              current.rx >= lastBytes.rx, current.tx >= lastBytes.tx else {
-            lastBytes = current
-            lastTime = now
-            return (0, 0)
-        }
-
-        let rxSpeed = Double(current.rx - lastBytes.rx) / elapsed
-        let txSpeed = Double(current.tx - lastBytes.tx) / elapsed
-
-        lastBytes = current
-        lastTime = now
-
-        return (rxSpeed, txSpeed)
-    }
-
-    func reset() {
-        lastBytes = (0, 0)
-        lastTime = Date()
-    }
-
-    private func getTotalBytes() -> (rx: UInt64, tx: UInt64) {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return (0, 0) }
-        defer { freeifaddrs(ifaddr) }
-
-        var rx: UInt64 = 0, tx: UInt64 = 0
-
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let name = String(cString: ptr.pointee.ifa_name)
-            guard name.hasPrefix("en") || name.hasPrefix("utun") || name.hasPrefix("pdp_ip") else { continue }
-
-            if let data = ptr.pointee.ifa_data {
-                let networkData = data.assumingMemoryBound(to: if_data.self).pointee
-                rx += UInt64(networkData.ifi_ibytes)
-                tx += UInt64(networkData.ifi_obytes)
-            }
-        }
-        return (rx, tx)
-    }
-}
-
-// MARK: - Latency Monitor
-struct LatencyPoint {
-    let timestamp: Date
-    let latency: Double?
-}
-
-enum LatencyMeasurement {
-    case success(milliseconds: Double)
-    case unavailable
-}
-
-class LatencyMonitor {
-    private(set) var history: [LatencyPoint] = []
-    private let maxHistoryDuration: TimeInterval = 300
-    private let queue = DispatchQueue(label: "latency.monitor")
-    private var isMeasuring = false
-    private let probeTimeout: TimeInterval = 1.5
-
-    func measureLatency(completion: @escaping (LatencyMeasurement) -> Void) {
-        queue.async {
-            guard !self.isMeasuring else { return }
-            self.isMeasuring = true
-
-            let start = Date()
-            // A single anycast target keeps samples comparable while avoiding DNS lookup time.
-            let connection = NWConnection(host: "1.1.1.1", port: 443, using: .tcp)
-            var completed = false
-            var timeout: DispatchWorkItem?
-
-            let finish: (LatencyMeasurement) -> Void = { result in
-                guard !completed else { return }
-                completed = true
-                timeout?.cancel()
-                connection.cancel()
-                self.isMeasuring = false
-                DispatchQueue.main.async { completion(result) }
-            }
-
-            let timeoutWorkItem = DispatchWorkItem {
-                finish(.unavailable)
-            }
-            timeout = timeoutWorkItem
-            self.queue.asyncAfter(deadline: .now() + self.probeTimeout, execute: timeoutWorkItem)
-
-            connection.stateUpdateHandler = { state in
-                guard !completed else { return }
-                if case .ready = state {
-                    let latency = Date().timeIntervalSince(start) * 1000
-                    finish(.success(milliseconds: latency))
-                } else if case .failed = state {
-                    finish(.unavailable)
-                }
-            }
-            connection.start(queue: self.queue)
-        }
-    }
-
-    func record(_ measurement: LatencyMeasurement) {
-        let latency: Double?
-        switch measurement {
-        case .success(let milliseconds):
-            latency = max(0, milliseconds)
-        case .unavailable:
-            latency = nil
-        }
-
-        let point = LatencyPoint(timestamp: Date(), latency: latency)
-        history.append(point)
-        pruneOldData()
-    }
-
-    func pruneOldData() {
-        let cutoff = Date().addingTimeInterval(-maxHistoryDuration)
-        history.removeAll { $0.timestamp < cutoff }
-    }
-
-    func getRecentHistory() -> [LatencyPoint] {
-        pruneOldData()
-        return history
-    }
-}
-
-// MARK: - Speed Test
-class SpeedTest {
-    enum State {
-        case idle
-        case testing(progress: Double, phase: String)
-        case completed(download: Double, upload: Double)
-        case failed
-    }
-
-    private let queue = DispatchQueue(label: "speed.test")
-    var onStateChange: ((State) -> Void)?
-    private var isCancelled = false
-
-    func start() {
-        isCancelled = false
-        DispatchQueue.main.async {
-            self.onStateChange?(.testing(progress: 0, phase: "Connecting..."))
-        }
-
-        queue.async {
-            self.runTest()
-        }
-    }
-
-    func cancel() {
-        isCancelled = true
-    }
-
-    private func runTest() {
-        // Download test - fetch a file and measure speed
-        var downloadSpeed: Double = 0
-        var uploadSpeed: Double = 0
-
-        // Phase 1: Download test
-        DispatchQueue.main.async {
-            self.onStateChange?(.testing(progress: 0.1, phase: "Testing download..."))
-        }
-
-        downloadSpeed = measureDownloadSpeed()
-
-        if isCancelled { return }
-
-        // Phase 2: Upload test
-        DispatchQueue.main.async {
-            self.onStateChange?(.testing(progress: 0.6, phase: "Testing upload..."))
-        }
-
-        uploadSpeed = measureUploadSpeed()
-
-        if isCancelled { return }
-
-        DispatchQueue.main.async {
-            self.onStateChange?(.testing(progress: 1.0, phase: "Complete"))
-        }
-
-        Thread.sleep(forTimeInterval: 0.3)
-
-        DispatchQueue.main.async {
-            if downloadSpeed > 0 || uploadSpeed > 0 {
-                self.onStateChange?(.completed(download: downloadSpeed, upload: uploadSpeed))
-            } else {
-                self.onStateChange?(.failed)
-            }
-        }
-    }
-
-    private func measureDownloadSpeed() -> Double {
-        let testURLs = [
-            "https://speed.cloudflare.com/__down?bytes=10000000",
-            "https://proof.ovh.net/files/1Mb.dat"
-        ]
-
-        for urlString in testURLs {
-            guard let url = URL(string: urlString) else { continue }
-
-            let semaphore = DispatchSemaphore(value: 0)
-            var speed: Double = 0
-
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 15
-            config.timeoutIntervalForResource = 15
-            let session = URLSession(configuration: config)
-
-            let startTime = Date()
-            var totalBytes: Int = 0
-
-            let task = session.dataTask(with: url) { data, response, error in
-                if let data = data, error == nil {
-                    totalBytes = data.count
-                    let elapsed = Date().timeIntervalSince(startTime)
-                    if elapsed > 0 {
-                        speed = Double(totalBytes) / elapsed // bytes per second
-                    }
-                }
-                semaphore.signal()
-            }
-            task.resume()
-
-            // Update progress during download
-            for i in 1...4 {
-                if isCancelled { task.cancel(); return 0 }
-                Thread.sleep(forTimeInterval: 0.5)
-                DispatchQueue.main.async {
-                    self.onStateChange?(.testing(progress: 0.1 + Double(i) * 0.1, phase: "Testing download..."))
-                }
-            }
-
-            _ = semaphore.wait(timeout: .now() + 10)
-
-            if speed > 0 { return speed }
-        }
-
-        return 0
-    }
-
-    private func measureUploadSpeed() -> Double {
-        guard let url = URL(string: "https://speed.cloudflare.com/__up") else { return 0 }
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var speed: Double = 0
-
-        // Create 1MB of random data
-        let dataSize = 1_000_000
-        var randomData = Data(count: dataSize)
-        randomData.withUnsafeMutableBytes { ptr in
-            guard let baseAddress = ptr.baseAddress else { return }
-            arc4random_buf(baseAddress, dataSize)
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 15
-
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        let session = URLSession(configuration: config)
-
-        let startTime = Date()
-
-        let task = session.uploadTask(with: request, from: randomData) { _, response, error in
-            if error == nil {
-                let elapsed = Date().timeIntervalSince(startTime)
-                if elapsed > 0 {
-                    speed = Double(dataSize) / elapsed
-                }
-            }
-            semaphore.signal()
-        }
-        task.resume()
-
-        // Update progress during upload
-        for i in 1...3 {
-            if isCancelled { task.cancel(); return 0 }
-            Thread.sleep(forTimeInterval: 0.5)
-            DispatchQueue.main.async {
-                self.onStateChange?(.testing(progress: 0.6 + Double(i) * 0.1, phase: "Testing upload..."))
-            }
-        }
-
-        _ = semaphore.wait(timeout: .now() + 10)
-
-        return speed
-    }
-}
-
-// MARK: - Chart View
-class LatencyChartView: NSView {
-    private struct YAxisScale {
-        let maxValue: Double
-        let interval: Double
-        let tickCount: Int
-    }
-
-    var latencyHistory: [LatencyPoint] = []
-    private let chartPadding: CGFloat = 10
-    private let rightPadding: CGFloat = 45
-    private let bottomPadding: CGFloat = 22
-    private let topPadding: CGFloat = 27
-    private let windowDuration: TimeInterval = 300
-    private let sampleInterval: TimeInterval = 1
-    private let minimumYAxisMax: Double = 20
-    private let warningLatency: Double = 100
-    private let yAxisTickCount = 5
-    private let yAxisHeadroomMultiplier = 1.25
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        Theme.cardBackground.setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
-
-        let chartRect = NSRect(
-            x: chartPadding,
-            y: bottomPadding,
-            width: bounds.width - chartPadding - rightPadding,
-            height: bounds.height - bottomPadding - topPadding
-        )
-
-        let now = Date()
-        let windowStart = now.addingTimeInterval(-windowDuration)
-        let visiblePoints = latencyHistory.filter { $0.timestamp >= windowStart }
-        let validLatencies = visiblePoints.compactMap(\.latency).filter(\.isFinite)
-        let axisScale = computeYAxisScale(from: validLatencies)
-
-        drawSummary(points: visiblePoints, now: now)
-        drawYAxis(in: chartRect, scale: axisScale)
-        drawXAxis(in: chartRect)
-        drawLatencyLine(in: chartRect, points: visiblePoints, windowStart: windowStart, scale: axisScale)
-        drawExceptionalMarkers(in: chartRect, points: visiblePoints, windowStart: windowStart, scale: axisScale)
-    }
-
-    private func computeYAxisScale(from latencies: [Double]) -> YAxisScale {
-        let denominator = Double(yAxisTickCount - 1)
-        guard !latencies.isEmpty else {
-            return YAxisScale(
-                maxValue: minimumYAxisMax,
-                interval: minimumYAxisMax / denominator,
-                tickCount: yAxisTickCount
-            )
-        }
-
-        // A robust high-percentile scale keeps one old spike from flattening the
-        // remaining five minutes. Values beyond the scale get explicit markers.
-        let sorted = latencies.sorted()
-        let percentileIndex = min(
-            sorted.count - 1,
-            max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
-        )
-        let representativePeak = sorted[percentileIndex]
-        let targetMax = max(minimumYAxisMax, representativePeak * yAxisHeadroomMultiplier)
-        let interval = niceInterval(for: targetMax / denominator)
-
-        return YAxisScale(
-            maxValue: interval * denominator,
-            interval: interval,
-            tickCount: yAxisTickCount
-        )
-    }
-
-    private func niceInterval(for value: Double) -> Double {
-        guard value > 0 else { return 5 }
-        let magnitude = pow(10, floor(log10(value)))
-        let fraction = value / magnitude
-        let niceFraction: Double
-
-        if fraction <= 1 {
-            niceFraction = 1
-        } else if fraction <= 2 {
-            niceFraction = 2
-        } else if fraction <= 5 {
-            niceFraction = 5
-        } else {
-            niceFraction = 10
-        }
-
-        return niceFraction * magnitude
-    }
-
-    private func yPosition(for latency: Double, in rect: NSRect, scale: YAxisScale) -> CGFloat {
-        let normalized = max(0, min(latency / scale.maxValue, 1))
-        return rect.minY + rect.height * CGFloat(normalized)
-    }
-
-    private func drawSummary(points: [LatencyPoint], now: Date) {
-        let recentCutoff = now.addingTimeInterval(-60)
-        let recentValues = points
-            .filter { $0.timestamp >= recentCutoff }
-            .compactMap(\.latency)
-            .filter(\.isFinite)
-        let average = recentValues.isEmpty
-            ? nil
-            : recentValues.reduce(0, +) / Double(recentValues.count)
-
-        let latestText: String
-        let latestColor: NSColor
-        if let latestPoint = points.last {
-            if let latency = latestPoint.latency, latency.isFinite {
-                latestText = "NOW \(Int(latency.rounded())) ms"
-                latestColor = statusColor(for: latency)
-            } else {
-                latestText = "NO RESPONSE"
-                latestColor = Theme.critical
-            }
-        } else {
-            latestText = "MEASURING…"
-            latestColor = Theme.textSecondary
-        }
-
-        let currentAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: latestColor,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        ]
-        (latestText as NSString).draw(
-            at: NSPoint(x: chartPadding, y: bounds.maxY - 19),
-            withAttributes: currentAttrs
-        )
-
-        if let average {
-            let averageText = "1M AVG \(Int(average.rounded())) ms"
-            let averageAttrs: [NSAttributedString.Key: Any] = [
-                .foregroundColor: Theme.textSecondary,
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
-            ]
-            (averageText as NSString).draw(
-                at: NSPoint(x: chartPadding + 88, y: bounds.maxY - 18),
-                withAttributes: averageAttrs
-            )
-        }
-
-        let cadenceText = "1s · 5m"
-        let cadenceAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
-        ]
-        let cadenceSize = (cadenceText as NSString).size(withAttributes: cadenceAttrs)
-        (cadenceText as NSString).draw(
-            at: NSPoint(x: bounds.maxX - chartPadding - cadenceSize.width, y: bounds.maxY - 18),
-            withAttributes: cadenceAttrs
-        )
-    }
-
-    private func statusColor(for latency: Double) -> NSColor {
-        if latency >= 200 { return Theme.critical }
-        if latency >= warningLatency { return Theme.warning }
-        return Theme.chartLine
-    }
-
-    private func drawYAxis(in rect: NSRect, scale: YAxisScale) {
-        let labels = (0..<scale.tickCount).map { index in
-            let value = scale.maxValue - (Double(index) * scale.interval)
-            return "\(Int(value.rounded())) ms"
-        }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
-        ]
-
-        let denominator = CGFloat(scale.tickCount - 1)
-        for (i, label) in labels.enumerated() {
-            let y = rect.minY + rect.height * CGFloat(scale.tickCount - 1 - i) / denominator - 5
-            (label as NSString).draw(at: NSPoint(x: rect.maxX + 5, y: y), withAttributes: attrs)
-        }
-
-        Theme.gridLine.setStroke()
-        for i in 0..<scale.tickCount {
-            let tickValue = Double(i) * scale.interval
-            if warningLatency < scale.maxValue,
-               abs(tickValue - warningLatency) < 0.001 {
-                continue
-            }
-
-            let y = rect.minY + rect.height * CGFloat(i) / denominator
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: rect.minX, y: y))
-            path.line(to: NSPoint(x: rect.maxX, y: y))
-            path.lineWidth = 0.5
-            path.stroke()
-        }
-
-        if warningLatency > 0, warningLatency < scale.maxValue {
-            let thresholdY = yPosition(for: warningLatency, in: rect, scale: scale)
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: rect.minX, y: thresholdY))
-            path.line(to: NSPoint(x: rect.maxX, y: thresholdY))
-            path.lineWidth = 0.5
-            let dashes: [CGFloat] = [4, 4]
-            path.setLineDash(dashes, count: 2, phase: 0)
-            Theme.warning.withAlphaComponent(0.55).setStroke()
-            path.stroke()
-        }
-    }
-
-    private func drawXAxis(in rect: NSRect) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
-        ]
-
-        let labels = ["−5m", "−4m", "−3m", "−2m", "−1m", "now"]
-        Theme.gridLine.withAlphaComponent(0.45).setStroke()
-
-        for i in 0..<labels.count {
-            let fraction = CGFloat(i) / CGFloat(labels.count - 1)
-            let x = rect.minX + rect.width * fraction
-            let label = labels[i]
-            let labelSize = (label as NSString).size(withAttributes: attrs)
-            let labelX = max(
-                chartPadding,
-                min(x - labelSize.width / 2, rect.maxX - labelSize.width)
-            )
-            (label as NSString).draw(at: NSPoint(x: labelX, y: 5), withAttributes: attrs)
-
-            let gridPath = NSBezierPath()
-            gridPath.move(to: NSPoint(x: x, y: rect.minY))
-            gridPath.line(to: NSPoint(x: x, y: rect.maxY))
-            gridPath.lineWidth = 0.5
-            gridPath.stroke()
-        }
-    }
-
-    private func xPosition(for timestamp: Date, in rect: NSRect, windowStart: Date) -> CGFloat {
-        let fraction = max(0, min(timestamp.timeIntervalSince(windowStart) / windowDuration, 1))
-        return rect.minX + rect.width * CGFloat(fraction)
-    }
-
-    private func makeLineSegments(
-        in rect: NSRect,
-        points: [LatencyPoint],
-        windowStart: Date,
-        scale: YAxisScale
-    ) -> [[NSPoint]] {
-        var segments: [[NSPoint]] = []
-        var current: [NSPoint] = []
-        var previousTimestamp: Date?
-
-        for point in points {
-            guard let latency = point.latency, latency.isFinite else {
-                if !current.isEmpty { segments.append(current) }
-                current = []
-                previousTimestamp = nil
-                continue
-            }
-
-            if let previousTimestamp,
-               point.timestamp.timeIntervalSince(previousTimestamp) > sampleInterval * 2.5 {
-                if !current.isEmpty { segments.append(current) }
-                current = []
-            }
-
-            current.append(
-                NSPoint(
-                    x: xPosition(for: point.timestamp, in: rect, windowStart: windowStart),
-                    y: yPosition(for: latency, in: rect, scale: scale)
-                )
-            )
-            previousTimestamp = point.timestamp
-        }
-
-        if !current.isEmpty { segments.append(current) }
-        return segments
-    }
-
-    private func path(for points: [NSPoint]) -> NSBezierPath {
-        let path = NSBezierPath()
-        guard let first = points.first else { return path }
-        path.move(to: first)
-        for point in points.dropFirst() {
-            path.line(to: point)
-        }
-        return path
-    }
-
-    private func drawLatencyLine(in rect: NSRect, points: [LatencyPoint], windowStart: Date, scale: YAxisScale) {
-        let segments = makeLineSegments(
-            in: rect,
-            points: points,
-            windowStart: windowStart,
-            scale: scale
-        )
-
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: rect).addClip()
-
-        for segment in segments {
-            guard !segment.isEmpty else { continue }
-            let linePath = path(for: segment)
-
-            if segment.count > 1, let first = segment.first, let last = segment.last {
-                let fillPath = linePath.copy() as! NSBezierPath
-                fillPath.line(to: NSPoint(x: last.x, y: rect.minY))
-                fillPath.line(to: NSPoint(x: first.x, y: rect.minY))
-                fillPath.close()
-                Theme.chartFill.setFill()
-                fillPath.fill()
-            }
-
-            Theme.accentGlow.withAlphaComponent(0.24).setStroke()
-            linePath.lineWidth = 4
-            linePath.lineJoinStyle = .round
-            linePath.stroke()
-
-            Theme.chartLine.setStroke()
-            linePath.lineWidth = 1.5
-            linePath.lineJoinStyle = .round
-            linePath.stroke()
-
-            if segment.count == 1, let point = segment.first {
-                Theme.chartLine.setFill()
-                NSBezierPath(ovalIn: NSRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3)).fill()
-            }
-        }
-
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
-    private func drawExceptionalMarkers(
-        in rect: NSRect,
-        points: [LatencyPoint],
-        windowStart: Date,
-        scale: YAxisScale
-    ) {
-        for point in points {
-            let x = xPosition(for: point.timestamp, in: rect, windowStart: windowStart)
-
-            if let latency = point.latency, latency.isFinite {
-                guard latency > scale.maxValue else { continue }
-                Theme.warning.setFill()
-                let marker = NSBezierPath()
-                marker.move(to: NSPoint(x: x, y: rect.maxY - 6))
-                marker.line(to: NSPoint(x: x - 3, y: rect.maxY - 1))
-                marker.line(to: NSPoint(x: x + 3, y: rect.maxY - 1))
-                marker.close()
-                marker.fill()
-            } else {
-                Theme.critical.setStroke()
-                let marker = NSBezierPath()
-                marker.move(to: NSPoint(x: x - 2.5, y: rect.maxY - 6))
-                marker.line(to: NSPoint(x: x + 2.5, y: rect.maxY - 1))
-                marker.move(to: NSPoint(x: x + 2.5, y: rect.maxY - 6))
-                marker.line(to: NSPoint(x: x - 2.5, y: rect.maxY - 1))
-                marker.lineWidth = 1.2
-                marker.stroke()
-            }
-        }
-    }
-}
-
-// MARK: - Header View
-class SectionHeaderView: NSView {
-    private let title: String
-    private let iconName: String
-
-    init(frame: NSRect, title: String, icon: String) {
-        self.title = title
-        self.iconName = icon
-        super.init(frame: frame)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        // Draw icon circle
-        let iconSize: CGFloat = 20
-        let iconRect = NSRect(x: 10, y: (bounds.height - iconSize) / 2, width: iconSize, height: iconSize)
-        Theme.accent.setFill()
-        NSBezierPath(ovalIn: iconRect).fill()
-
-        // Draw icon symbol
-        let iconAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.white,
-            .font: NSFont.systemFont(ofSize: 11, weight: .bold)
-        ]
-        let iconText = iconName
-        let iconTextSize = (iconText as NSString).size(withAttributes: iconAttrs)
-        (iconText as NSString).draw(
-            at: NSPoint(x: iconRect.midX - iconTextSize.width / 2, y: iconRect.midY - iconTextSize.height / 2),
-            withAttributes: iconAttrs
-        )
-
-        // Draw title
-        let titleAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textPrimary,
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
-        ]
-        (title as NSString).draw(at: NSPoint(x: 38, y: (bounds.height - 14) / 2), withAttributes: titleAttrs)
-    }
-}
-
-// MARK: - Current Speeds View
-class CurrentSpeedsView: NSView {
-    var downloadSpeed: Double? = nil  // nil means no test run yet
-    var uploadSpeed: Double? = nil
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        Theme.cardBackground.setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
-
-        let midX = bounds.width / 2
-
-        // Download section
-        drawSpeedSection(
-            at: NSPoint(x: midX / 2, y: bounds.height / 2),
-            label: "DOWNLOAD",
-            speed: downloadSpeed,
-            icon: "↓",
-            iconColor: Theme.accent
-        )
-
-        // Separator line
-        Theme.gridLine.setStroke()
-        let sepPath = NSBezierPath()
-        sepPath.move(to: NSPoint(x: midX, y: 15))
-        sepPath.line(to: NSPoint(x: midX, y: bounds.height - 15))
-        sepPath.lineWidth = 1
-        sepPath.stroke()
-
-        // Upload section
-        drawSpeedSection(
-            at: NSPoint(x: midX + midX / 2, y: bounds.height / 2),
-            label: "UPLOAD",
-            speed: uploadSpeed,
-            icon: "↑",
-            iconColor: Theme.accent
-        )
-    }
-
-    private func drawSpeedSection(at center: NSPoint, label: String, speed: Double?, icon: String, iconColor: NSColor) {
-        // Label
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.systemFont(ofSize: 10, weight: .medium)
-        ]
-        let labelSize = (label as NSString).size(withAttributes: labelAttrs)
-        (label as NSString).draw(
-            at: NSPoint(x: center.x - labelSize.width / 2, y: center.y + 15),
-            withAttributes: labelAttrs
-        )
-
-        // Icon
-        let iconAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: iconColor,
-            .font: NSFont.systemFont(ofSize: 16, weight: .bold)
-        ]
-
-        let speedAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textPrimary,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
-        ]
-        let unitAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular)
-        ]
-
-        if let speed = speed {
-            // Show actual speed
-            let iconSize = (icon as NSString).size(withAttributes: iconAttrs)
-            let (speedValue, speedUnit) = formatSpeedWithUnit(speed)
-
-            let speedSize = (speedValue as NSString).size(withAttributes: speedAttrs)
-            let unitSize = (speedUnit as NSString).size(withAttributes: unitAttrs)
-            let totalWidth = iconSize.width + 5 + speedSize.width + 3 + unitSize.width
-
-            var x = center.x - totalWidth / 2
-            let y = center.y - 20
-
-            (icon as NSString).draw(at: NSPoint(x: x, y: y - 2), withAttributes: iconAttrs)
-            x += iconSize.width + 5
-            (speedValue as NSString).draw(at: NSPoint(x: x, y: y - 5), withAttributes: speedAttrs)
-            x += speedSize.width + 3
-            (speedUnit as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: unitAttrs)
-        } else {
-            // Show placeholder
-            let placeholder = "-- --"
-            let placeholderAttrs: [NSAttributedString.Key: Any] = [
-                .foregroundColor: Theme.textSecondary,
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
-            ]
-            let placeholderSize = (placeholder as NSString).size(withAttributes: placeholderAttrs)
-            (placeholder as NSString).draw(
-                at: NSPoint(x: center.x - placeholderSize.width / 2, y: center.y - 25),
-                withAttributes: placeholderAttrs
-            )
-        }
-    }
-
-    private func formatSpeedWithUnit(_ bytesPerSec: Double) -> (String, String) {
-        let bitsPerSec = bytesPerSec * 8
-        if bitsPerSec < 1000 { return (String(format: "%.0f", bitsPerSec), "bps") }
-        if bitsPerSec < 1_000_000 { return (String(format: "%.1f", bitsPerSec / 1000), "Kbps") }
-        if bitsPerSec < 1_000_000_000 { return (String(format: "%.1f", bitsPerSec / 1_000_000), "Mbps") }
-        return (String(format: "%.1f", bitsPerSec / 1_000_000_000), "Gbps")
-    }
-}
-
-// MARK: - Speed Test Button View
-class SpeedTestButtonView: NSView {
-    var onClick: (() -> Void)?
-    var progress: Double = 0
-    var isRunning: Bool = false
-    var statusText: String = "RUN SPEED TEST"
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let existing = trackingArea {
-            removeTrackingArea(existing)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        needsDisplay = true
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if !isRunning {
-            onClick?()
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        let buttonRect = bounds.insetBy(dx: 0, dy: 0)
-
-        // Draw button background with gradient
-        let gradient: NSGradient
-        if isHovered && !isRunning {
-            gradient = NSGradient(
-                starting: Theme.accentGlow,
-                ending: Theme.buttonGradientTop
-            )!
-        } else {
-            gradient = NSGradient(
-                starting: Theme.buttonGradientTop,
-                ending: Theme.buttonGradientBottom
-            )!
-        }
-
-        let buttonPath = NSBezierPath(roundedRect: buttonRect, xRadius: 6, yRadius: 6)
-        gradient.draw(in: buttonPath, angle: 90)
-
-        // Draw progress bar if running
-        if isRunning && progress > 0 {
-            let progressRect = NSRect(
-                x: buttonRect.minX,
-                y: buttonRect.minY,
-                width: buttonRect.width * CGFloat(progress),
-                height: buttonRect.height
-            )
-
-            let progressGradient = NSGradient(
-                starting: Theme.accentGlow,
-                ending: Theme.accent
-            )!
-
-            NSGraphicsContext.saveGraphicsState()
-            buttonPath.addClip()
-            progressGradient.draw(in: progressRect, angle: 0)
-            NSGraphicsContext.restoreGraphicsState()
-
-            // Draw animated stripes
-            drawAnimatedStripes(in: buttonRect, progress: progress)
-        }
-
-        // Draw button text
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.white,
-            .font: NSFont.systemFont(ofSize: 13, weight: .semibold)
-        ]
-        let textSize = (statusText as NSString).size(withAttributes: textAttrs)
-        (statusText as NSString).draw(
-            at: NSPoint(x: (bounds.width - textSize.width) / 2, y: (bounds.height - textSize.height) / 2),
-            withAttributes: textAttrs
-        )
-    }
-
-    private func drawAnimatedStripes(in rect: NSRect, progress: Double) {
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).addClip()
-
-        let stripeWidth: CGFloat = 15
-        let progressWidth = rect.width * CGFloat(progress)
-        let stripeColor = NSColor.white.withAlphaComponent(0.15)
-        stripeColor.setFill()
-
-        let offset = CGFloat(Int(Date().timeIntervalSinceReferenceDate * 30) % Int(stripeWidth * 2))
-
-        var x: CGFloat = -stripeWidth * 2 + offset
-        while x < progressWidth {
-            let stripePath = NSBezierPath()
-            stripePath.move(to: NSPoint(x: x, y: rect.minY))
-            stripePath.line(to: NSPoint(x: x + stripeWidth, y: rect.minY))
-            stripePath.line(to: NSPoint(x: x + stripeWidth + rect.height, y: rect.maxY))
-            stripePath.line(to: NSPoint(x: x + rect.height, y: rect.maxY))
-            stripePath.close()
-            stripePath.fill()
-            x += stripeWidth * 2
-        }
-
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
-    func update(progress: Double, status: String, running: Bool) {
-        self.progress = progress
-        self.statusText = status
-        self.isRunning = running
-        needsDisplay = true
-    }
-}
-
-// MARK: - Quit Button
-class QuitButton: NSView {
-    var onClick: (() -> Void)?
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let existing = trackingArea {
-            removeTrackingArea(existing)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        needsDisplay = true
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        onClick?()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        if isHovered {
-            NSColor(red: 0.3, green: 0.35, blue: 0.45, alpha: 1.0).setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
-        }
-
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: Theme.textSecondary,
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium)
-        ]
-        let text = "Quit"
-        let textSize = (text as NSString).size(withAttributes: textAttrs)
-        (text as NSString).draw(
-            at: NSPoint(x: (bounds.width - textSize.width) / 2, y: (bounds.height - textSize.height) / 2),
-            withAttributes: textAttrs
-        )
-    }
-}
-
-// MARK: - Main Popover View
-class MainPopoverView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        Theme.background.setFill()
-        bounds.fill()
-    }
-}
-
-// MARK: - Helpers
-func formatSpeed(_ bytesPerSec: Double) -> String {
-    if bytesPerSec < 1024 { return String(format: "%.0fB", bytesPerSec) }
-    if bytesPerSec < 1024 * 1024 { return String(format: "%.1fK", bytesPerSec / 1024) }
-    if bytesPerSec < 1024 * 1024 * 1024 { return String(format: "%.1fM", bytesPerSec / 1024 / 1024) }
-    return String(format: "%.1fG", bytesPerSec / 1024 / 1024 / 1024)
-}
-
-// MARK: - App Delegate
-class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var monitor = NetworkMonitor()
-    private var latencyMonitor = LatencyMonitor()
-    private var speedTest = SpeedTest()
-    private var timer: Timer?
-    private var latencyTimer: Timer?
-    private var animationTimer: Timer?
     private var popover: NSPopover!
-    private var chartView: LatencyChartView!
-    private var speedsView: CurrentSpeedsView!
-    private var speedTestButton: SpeedTestButtonView!
-    private var eventMonitor: Any?
+    private var contentView: PopoverContentView!
+    private var trafficTimer: Timer?
+    private var latencyTimer: Timer?
+
+    private var pathState: ConnectionState = .checking
+    private var displayedConnectionState: ConnectionState = .checking
+    private var latestTraffic: ThroughputSample = .zero
+    private var lastSpeedTestResult: SpeedTestResult?
+    private var isSpeedTestRunning = false
+    private var isMonitoringPaused = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "↓ -- ↑ --"
-        statusItem.button?.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        statusItem.button?.action = #selector(togglePopover)
-        statusItem.button?.target = self
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        setUpStatusItem()
+        setUpPopover()
+        loadLastSpeedTest()
+        setUpCallbacks()
+        setUpWorkspaceNotifications()
+        updateLaunchAtLoginControl()
 
-        setupPopover()
-        setupSpeedTest()
+        contentView.updateSpeedTest(result: lastSpeedTestResult, state: .idle)
+        connectionMonitor.start()
+        startMonitoringTimers()
 
-        _ = monitor.getSpeed()
-        startTimer()
-        startLatencyTimer()
-
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(handleWake),
-            name: NSWorkspace.didWakeNotification, object: nil)
+        if !UserDefaults.standard.bool(forKey: DefaultsKey.hasShownWelcome) {
+            UserDefaults.standard.set(true, forKey: DefaultsKey.hasShownWelcome)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                self?.showPopover()
+            }
+        }
     }
 
-    private func setupPopover() {
-        let popoverWidth: CGFloat = 340
-        let popoverHeight: CGFloat = 380
+    func applicationWillTerminate(_ notification: Notification) {
+        stopMonitoringTimers()
+        latencyMonitor.cancel()
+        connectionMonitor.cancel()
+        speedTest.cancel()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
 
-        let mainView = MainPopoverView(frame: NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight))
+    private func setUpStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        guard let button = statusItem.button else { return }
+        button.title = "Measuring…"
+        button.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        button.target = self
+        button.action = #selector(statusItemClicked(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        button.toolTip = "SpeedBar is checking your connection"
+        button.setAccessibilityLabel("SpeedBar")
+        button.setAccessibilityValue("Measuring connection")
+    }
 
-        // Connection Delay Header
-        let delayHeader = SectionHeaderView(
-            frame: NSRect(x: 10, y: popoverHeight - 35, width: popoverWidth - 20, height: 30),
-            title: "LIVE LATENCY",
-            icon: "◉"
+    private func setUpPopover() {
+        let size = NSSize(width: 360, height: 472)
+        contentView = PopoverContentView(
+            frame: NSRect(origin: .zero, size: size)
         )
-        mainView.addSubview(delayHeader)
 
-        // Chart View
-        chartView = LatencyChartView(frame: NSRect(x: 10, y: popoverHeight - 175, width: popoverWidth - 20, height: 135))
-        mainView.addSubview(chartView)
-
-        // Current Speeds Header
-        let speedsHeader = SectionHeaderView(
-            frame: NSRect(x: 10, y: popoverHeight - 205, width: popoverWidth - 20, height: 30),
-            title: "LAST SPEED TEST RESULT",
-            icon: "⚡"
-        )
-        mainView.addSubview(speedsHeader)
-
-        // Current Speeds View
-        speedsView = CurrentSpeedsView(frame: NSRect(x: 10, y: popoverHeight - 295, width: popoverWidth - 20, height: 85))
-        mainView.addSubview(speedsView)
-
-        // Speed Test Button
-        speedTestButton = SpeedTestButtonView(frame: NSRect(x: 10, y: popoverHeight - 340, width: popoverWidth - 20, height: 38))
-        speedTestButton.onClick = { [weak self] in
-            self?.runSpeedTest()
-        }
-        mainView.addSubview(speedTestButton)
-
-        // Quit Button
-        let quitButton = QuitButton(frame: NSRect(x: (popoverWidth - 60) / 2, y: 10, width: 60, height: 25))
-        quitButton.onClick = { [weak self] in
-            self?.quit()
-        }
-        mainView.addSubview(quitButton)
+        contentView.testButton.target = self
+        contentView.testButton.action = #selector(speedTestButtonClicked)
+        contentView.launchAtLoginButton.target = self
+        contentView.launchAtLoginButton.action = #selector(toggleLaunchAtLogin)
+        contentView.settingsButton.target = self
+        contentView.settingsButton.action = #selector(showOptions)
+        contentView.quitButton.target = self
+        contentView.quitButton.action = #selector(quit)
 
         let viewController = NSViewController()
-        viewController.view = mainView
+        viewController.view = contentView
 
         popover = NSPopover()
-        popover.contentSize = NSSize(width: popoverWidth, height: popoverHeight)
-        popover.behavior = .applicationDefined
+        popover.contentSize = size
+        popover.behavior = .transient
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.contentViewController = viewController
     }
 
-    private func setupSpeedTest() {
+    private func setUpCallbacks() {
+        connectionMonitor.onChange = { [weak self] state in
+            self?.handlePathChange(state)
+        }
+
         speedTest.onStateChange = { [weak self] state in
-            guard let self = self else { return }
+            self?.handleSpeedTestState(state)
+        }
+    }
 
-            switch state {
-            case .idle:
-                self.speedTestButton.update(progress: 0, status: "RUN SPEED TEST", running: false)
-                self.stopAnimationTimer()
+    private func setUpWorkspaceNotifications() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(
+            self,
+            selector: #selector(handleSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
 
-            case .testing(let progress, let phase):
-                self.speedTestButton.update(progress: progress, status: phase, running: true)
-                self.startAnimationTimer()
+    private func handlePathChange(_ state: ConnectionState) {
+        let didChangeInterface = state.interfaceName != pathState.interfaceName
+        let didChangeAvailability = state.availability != pathState.availability
+        pathState = state
 
-            case .completed(let download, let upload):
-                let dlSpeed = self.formatSpeedMbps(download)
-                let ulSpeed = self.formatSpeedMbps(upload)
-                self.speedTestButton.update(progress: 0, status: "↓\(dlSpeed) ↑\(ulSpeed)", running: false)
-                self.stopAnimationTimer()
+        if didChangeInterface || didChangeAvailability {
+            networkMonitor.reset()
+        }
 
-                // Update the speeds view with test results
-                self.speedsView.downloadSpeed = download
-                self.speedsView.uploadSpeed = upload
-                self.speedsView.needsDisplay = true
+        if !state.isOnline, isSpeedTestRunning {
+            speedTest.cancel()
+        }
+        if !state.isOnline {
+            latencyMonitor.cancel()
+        }
 
-                // Reset button text after showing results (but keep speeds view)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                    if self?.speedTestButton.statusText.hasPrefix("↓") == true {
-                        self?.speedTestButton.update(progress: 0, status: "RUN SPEED TEST", running: false)
-                    }
-                }
+        guard !isMonitoringPaused else { return }
+        displayedConnectionState = state
+        contentView.updateConnection(state, summary: contentView.chartView.summary)
+        updateSpeed()
 
-            case .failed:
-                self.speedTestButton.update(progress: 0, status: "Test Failed - Retry", running: false)
-                self.stopAnimationTimer()
+        if state.isOnline, didChangeAvailability {
+            measureLatency()
+        } else if state.availability == .offline, didChangeAvailability {
+            recordLatency(.offline)
+        }
+    }
+
+    private func handleSpeedTestState(_ state: SpeedTest.State) {
+        switch state {
+        case .idle:
+            isSpeedTestRunning = false
+        case .testing:
+            isSpeedTestRunning = true
+        case .completed(let result):
+            isSpeedTestRunning = false
+            lastSpeedTestResult = result
+            save(result)
+        case .failed, .cancelled:
+            isSpeedTestRunning = false
+        }
+
+        contentView.updateSpeedTest(result: lastSpeedTestResult, state: state)
+        updateContextualAccessibility()
+    }
+
+    private func startMonitoringTimers() {
+        guard !isMonitoringPaused else { return }
+        stopMonitoringTimers()
+
+        let newTrafficTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateSpeed()
             }
         }
-    }
+        newTrafficTimer.tolerance = 0.15
+        RunLoop.main.add(newTrafficTimer, forMode: .common)
+        trafficTimer = newTrafficTimer
 
-    private func formatSpeedMbps(_ bytesPerSec: Double) -> String {
-        let mbps = bytesPerSec * 8 / 1_000_000
-        if mbps < 1 {
-            return String(format: "%.0f Kbps", bytesPerSec * 8 / 1000)
+        let newLatencyTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.measureLatency()
+            }
         }
-        return String(format: "%.1f Mbps", mbps)
+        newLatencyTimer.tolerance = 0.08
+        RunLoop.main.add(newLatencyTimer, forMode: .common)
+        latencyTimer = newLatencyTimer
+
+        updateSpeed()
+        measureLatency()
     }
 
-    private func runSpeedTest() {
-        speedTest.start()
+    private func stopMonitoringTimers() {
+        trafficTimer?.invalidate()
+        trafficTimer = nil
+        latencyTimer?.invalidate()
+        latencyTimer = nil
     }
 
-    private func startAnimationTimer() {
-        stopAnimationTimer()
-        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            self?.speedTestButton.needsDisplay = true
-        }
-    }
-
-    private func stopAnimationTimer() {
-        animationTimer?.invalidate()
-        animationTimer = nil
-    }
-
-    @objc private func togglePopover(_ sender: Any?) {
-        let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp {
-            quit()
+    private func updateSpeed() {
+        contentView.refreshRelativeTimes()
+        guard !isMonitoringPaused else {
+            latestTraffic = .zero
+            contentView.updateTraffic(.zero)
+            updateStatusItem()
             return
         }
 
-        guard let button = statusItem.button else { return }
-        if popover.isShown {
-            closePopover()
+        if pathState.isOnline {
+            latestTraffic = networkMonitor.getSpeed(interfaceName: pathState.interfaceName)
         } else {
-            chartView.latencyHistory = latencyMonitor.getRecentHistory()
-            chartView.needsDisplay = true
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            startEventMonitor()
+            networkMonitor.reset()
+            latestTraffic = .zero
+        }
+        contentView.updateTraffic(latestTraffic)
+        updateStatusItem()
+    }
+
+    private func measureLatency() {
+        guard !isMonitoringPaused else { return }
+        switch pathState.availability {
+        case .online:
+            latencyMonitor.measureLatency(isOnline: true) { [weak self] measurement in
+                self?.recordLatency(measurement)
+            }
+        case .offline:
+            recordLatency(.offline)
+        case .checking, .connecting, .paused:
+            break
         }
     }
 
-    private func closePopover() {
-        popover.performClose(nil)
-        stopEventMonitor()
+    private func recordLatency(_ measurement: LatencyMeasurement) {
+        latencyMonitor.record(measurement)
+        let history = latencyMonitor.getRecentHistory()
+        contentView.updateLatency(history)
+        updateStatusItem()
     }
 
-    private func startEventMonitor() {
-        stopEventMonitor()
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            if self?.popover.isShown == true {
-                self?.closePopover()
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+
+        let title: String
+        let tooltip: String
+        let accessibilityValue: String
+        if isMonitoringPaused {
+            title = "Paused"
+            tooltip = "SpeedBar monitoring is paused"
+            accessibilityValue = "Monitoring paused"
+        } else {
+            switch pathState.availability {
+            case .online:
+                title = "↓\(menuBarRate(latestTraffic.downloadBytesPerSecond)) ↑\(menuBarRate(latestTraffic.uploadBytesPerSecond))"
+                let latencyText = contentView.chartView.summary.current.map {
+                    "\(Int($0.rounded())) millisecond latency"
+                } ?? "latency unavailable"
+                tooltip = "Download \(RateFormatter.bytesPerSecond(latestTraffic.downloadBytesPerSecond)) · Upload \(RateFormatter.bytesPerSecond(latestTraffic.uploadBytesPerSecond)) · \(latencyText)"
+                accessibilityValue = tooltip
+            case .offline:
+                title = "Offline"
+                tooltip = "SpeedBar: no internet connection"
+                accessibilityValue = "No internet connection"
+            case .connecting:
+                title = "Connecting…"
+                tooltip = "SpeedBar is waiting for the network"
+                accessibilityValue = "Connecting"
+            case .checking:
+                title = "Measuring…"
+                tooltip = "SpeedBar is checking your connection"
+                accessibilityValue = "Measuring connection"
+            case .paused:
+                title = "Paused"
+                tooltip = "SpeedBar monitoring is paused"
+                accessibilityValue = "Monitoring paused"
             }
         }
+
+        button.title = title
+        button.toolTip = tooltip
+        button.setAccessibilityValue(accessibilityValue)
     }
 
-    private func stopEventMonitor() {
-        if let monitor = eventMonitor {
-            NSEvent.removeMonitor(monitor)
-            eventMonitor = nil
+    private func menuBarRate(_ bytesPerSecond: Double) -> String {
+        let value = max(0, bytesPerSecond.isFinite ? bytesPerSecond : 0)
+        if value < 1_000 {
+            return "\(Int(value.rounded()))B/s"
+        }
+        if value < 1_000_000 {
+            let scaled = value / 1_000
+            return scaled >= 100
+                ? String(format: "%.0fK/s", scaled)
+                : String(format: "%.1fK/s", scaled)
+        }
+        if value < 1_000_000_000 {
+            let scaled = value / 1_000_000
+            return scaled >= 100
+                ? String(format: "%.0fM/s", scaled)
+                : String(format: "%.1fM/s", scaled)
+        }
+        return String(format: "%.1fG/s", value / 1_000_000_000)
+    }
+
+    @objc private func statusItemClicked(_ sender: Any?) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showContextMenu(using: NSApp.currentEvent)
+        } else if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            showPopover()
+        }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        contentView.updateLatency(latencyMonitor.getRecentHistory())
+        contentView.updateConnection(
+            displayedConnectionState,
+            summary: contentView.chartView.summary
+        )
+        contentView.refreshRelativeTimes()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func showContextMenu(using event: NSEvent?) {
+        guard let event, let button = statusItem.button else { return }
+        NSMenu.popUpContextMenu(makeContextMenu(), with: event, for: button)
+    }
+
+    private func makeContextMenu() -> NSMenu {
+        let menu = NSMenu(title: "SpeedBar")
+        menu.autoenablesItems = false
+
+        menu.addItem(menuItem("Open SpeedBar", action: #selector(openFromMenu)))
+        menu.addItem(
+            menuItem(
+                isSpeedTestRunning ? "Cancel Speed Test" : "Run Speed Test",
+                action: #selector(speedTestButtonClicked)
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            menuItem(
+                isMonitoringPaused ? "Resume Monitoring" : "Pause Monitoring",
+                action: #selector(toggleMonitoring)
+            )
+        )
+
+        let loginItem = menuItem("Launch at Login", action: #selector(toggleLaunchAtLogin))
+        if #available(macOS 13.0, *) {
+            loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } else {
+            loginItem.isEnabled = false
+        }
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
+        menu.addItem(menuItem("About SpeedBar", action: #selector(showAbout)))
+        menu.addItem(menuItem("Quit SpeedBar", action: #selector(quit), keyEquivalent: "q"))
+        return menu
+    }
+
+    private func menuItem(
+        _ title: String,
+        action: Selector,
+        keyEquivalent: String = ""
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        item.isEnabled = true
+        return item
+    }
+
+    @objc private func openFromMenu() {
+        showPopover()
+    }
+
+    @objc private func speedTestButtonClicked() {
+        if isSpeedTestRunning {
+            speedTest.cancel()
+            return
+        }
+        guard pathState.isOnline else {
+            contentView.updateSpeedTest(
+                result: lastSpeedTestResult,
+                state: .failed(message: "Connect to the internet, then try again.")
+            )
+            return
+        }
+        speedTest.start()
+    }
+
+    @objc private func toggleMonitoring() {
+        isMonitoringPaused.toggle()
+
+        if isMonitoringPaused {
+            stopMonitoringTimers()
+            latencyMonitor.cancel()
+            networkMonitor.reset()
+            displayedConnectionState = ConnectionState(
+                availability: .paused,
+                interfaceName: nil,
+                interfaceLabel: "Monitoring paused",
+                isExpensive: false,
+                isConstrained: false
+            )
+            contentView.updateConnection(displayedConnectionState, summary: .empty)
+            latestTraffic = .zero
+            contentView.updateTraffic(.zero)
+        } else {
+            displayedConnectionState = pathState
+            contentView.updateConnection(pathState, summary: contentView.chartView.summary)
+            startMonitoringTimers()
+        }
+        updateStatusItem()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            showError(
+                title: "Launch at Login couldn’t be changed",
+                message: error.localizedDescription
+            )
+        }
+        updateLaunchAtLoginControl()
+    }
+
+    private func updateLaunchAtLoginControl() {
+        if #available(macOS 13.0, *) {
+            contentView.launchAtLoginButton.isEnabled = true
+            contentView.launchAtLoginButton.state = SMAppService.mainApp.status == .enabled
+                ? .on
+                : .off
+            contentView.launchAtLoginButton.toolTip = "Start SpeedBar automatically after you sign in"
+        } else {
+            contentView.launchAtLoginButton.state = .off
+            contentView.launchAtLoginButton.isEnabled = false
+            contentView.launchAtLoginButton.toolTip = "Available on macOS 13 or later"
+        }
+    }
+
+    @objc private func showOptions() {
+        let menu = NSMenu(title: "SpeedBar options")
+        menu.autoenablesItems = false
+        menu.addItem(
+            menuItem(
+                isMonitoringPaused ? "Resume Monitoring" : "Pause Monitoring",
+                action: #selector(toggleMonitoring)
+            )
+        )
+        menu.addItem(menuItem("About SpeedBar", action: #selector(showAbout)))
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: contentView.settingsButton.bounds.minX, y: contentView.settingsButton.bounds.maxY),
+            in: contentView.settingsButton
+        )
+    }
+
+    @objc private func showAbout() {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "Development"
+        let credits = NSAttributedString(
+            string: "A focused view of live traffic, latency, and connection capacity.\n\nLatency uses a TCP probe to 1.1.1.1. Speed tests use Cloudflare and transfer about 26 MB.",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "SpeedBar",
+            .applicationVersion: version,
+            .credits: credits
+        ])
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func updateContextualAccessibility() {
+        contentView.testButton.setAccessibilityLabel(
+            isSpeedTestRunning ? "Cancel speed test" : contentView.testButton.title
+        )
+    }
+
+    private func showError(title: String, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func save(_ result: SpeedTestResult) {
+        let defaults = UserDefaults.standard
+        defaults.set(result.downloadBytesPerSecond, forKey: DefaultsKey.lastDownloadSpeed)
+        defaults.set(result.uploadBytesPerSecond, forKey: DefaultsKey.lastUploadSpeed)
+        defaults.set(result.completedAt, forKey: DefaultsKey.lastSpeedTestDate)
+    }
+
+    private func loadLastSpeedTest() {
+        let defaults = UserDefaults.standard
+        let download = defaults.double(forKey: DefaultsKey.lastDownloadSpeed)
+        let upload = defaults.double(forKey: DefaultsKey.lastUploadSpeed)
+        guard download > 0,
+              upload > 0,
+              let date = defaults.object(forKey: DefaultsKey.lastSpeedTestDate) as? Date else {
+            return
+        }
+        lastSpeedTestResult = SpeedTestResult(
+            downloadBytesPerSecond: download,
+            uploadBytesPerSecond: upload,
+            completedAt: date
+        )
+    }
+
+    @objc private func handleSleep() {
+        stopMonitoringTimers()
+        latencyMonitor.cancel()
+        networkMonitor.reset()
+        if isSpeedTestRunning {
+            speedTest.cancel()
         }
     }
 
     @objc private func handleWake() {
-        monitor.reset()
-        startTimer()
-        startLatencyTimer()
-    }
-
-    private func startTimer() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateSpeed()
-        }
-        timer?.tolerance = 0.2
-    }
-
-    private func startLatencyTimer() {
-        latencyTimer?.invalidate()
-        let newTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.measureLatency()
-        }
-        newTimer.tolerance = 0.1
-        RunLoop.main.add(newTimer, forMode: .common)
-        latencyTimer = newTimer
-        measureLatency()
-    }
-
-    private func measureLatency() {
-        latencyMonitor.measureLatency { [weak self] measurement in
-            self?.latencyMonitor.record(measurement)
-            if self?.popover.isShown == true {
-                self?.chartView.latencyHistory = self?.latencyMonitor.getRecentHistory() ?? []
-                self?.chartView.needsDisplay = true
-            }
-        }
-    }
-
-    private func updateSpeed() {
-        let (down, up) = monitor.getSpeed()
-        let text = "↓\(formatSpeed(down)) ↑\(formatSpeed(up))"
-        DispatchQueue.main.async {
-            self.statusItem.button?.title = text
-        }
+        networkMonitor.reset()
+        guard !isMonitoringPaused else { return }
+        displayedConnectionState = pathState
+        contentView.updateConnection(pathState, summary: contentView.chartView.summary)
+        startMonitoringTimers()
     }
 
     @objc private func quit() {
@@ -1271,9 +542,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Main
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+MainActor.assumeIsolated {
+    let application = NSApplication.shared
+    let applicationDelegate = AppDelegate()
+    application.delegate = applicationDelegate
+    application.setActivationPolicy(.accessory)
+    application.run()
+}
